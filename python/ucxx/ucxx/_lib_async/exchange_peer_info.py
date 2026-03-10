@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
-import asyncio
 import logging
 import struct
+
+import trio
 
 from ucxx._lib.arr import Array
 
@@ -25,16 +26,17 @@ async def exchange_peer_info(endpoint, msg_tag, listener, connect_timeout=5.0):
 
     # Send/recv peer information. Notice, we force an `await` between the two
     # streaming calls (see <https://github.com/rapidsai/ucx-py/pull/509>)
-    if listener is True:
-        req = endpoint.stream_send(my_info_arr)
-        await asyncio.wait_for(req.wait(), timeout=connect_timeout)
-        req = endpoint.stream_recv(peer_info_arr)
-        await asyncio.wait_for(req.wait(), timeout=connect_timeout)
-    else:
-        req = endpoint.stream_recv(peer_info_arr)
-        await asyncio.wait_for(req.wait(), timeout=connect_timeout)
-        req = endpoint.stream_send(my_info_arr)
-        await asyncio.wait_for(req.wait(), timeout=connect_timeout)
+    with trio.fail_after(connect_timeout):
+        if listener is True:
+            req = endpoint.stream_send(my_info_arr)
+            await req.wait()
+            req = endpoint.stream_recv(peer_info_arr)
+            await req.wait()
+        else:
+            req = endpoint.stream_recv(peer_info_arr)
+            await req.wait()
+            req = endpoint.stream_send(my_info_arr)
+            await req.wait()
 
     # Unpacking and sanity check of the peer information
     ret = {}

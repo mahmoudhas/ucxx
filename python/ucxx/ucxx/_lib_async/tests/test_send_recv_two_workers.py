@@ -1,16 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import multiprocessing
 import os
 import random
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
-from ucxx._lib_async.utils import get_event_loop
 from ucxx._lib_async.utils_test import (
     am_recv,
     am_send,
@@ -55,43 +54,48 @@ def client(port, func, comm_api, timeout):
     # must create context before importing
     # cudf/cupy/etc
 
-    ucxx.init()
+    rx_cuda_obj = None
 
-    async def read():
-        await asyncio.sleep(1)
-        ep = await get_ep("client", port)
+    async def main():
+        nonlocal rx_cuda_obj
 
-        for i in range(ITERATIONS):
-            print_with_pid(f"Client iteration {i}")
-            if comm_api == "tag":
-                frames, msg = await recv(ep)
-            else:
-                while True:
-                    try:
-                        frames, msg = await am_recv(ep)
-                    except ucxx.exceptions.UCXNoMemoryError as e:
-                        # Client didn't receive/consume messages quickly enough,
-                        # new AM failed to allocate memory and raised this
-                        # exception, we need to keep trying.
-                        print_with_pid(f"Client exception: {type(e)} {e}")
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+
+            with trio.fail_after(timeout):
+                await trio.sleep(1)
+                ep = await get_ep("client", port)
+
+                for i in range(ITERATIONS):
+                    print_with_pid(f"Client iteration {i}")
+                    if comm_api == "tag":
+                        frames, msg = await recv(ep)
                     else:
-                        break
+                        while True:
+                            try:
+                                frames, msg = await am_recv(ep)
+                            except ucxx.exceptions.UCXNoMemoryError as e:
+                                # Client didn't receive/consume messages quickly enough,
+                                # new AM failed to allocate memory and raised this
+                                # exception, we need to keep trying.
+                                print_with_pid(f"Client exception: {type(e)} {e}")
+                            else:
+                                break
 
-        close_msg = b"shutdown listener"
+                close_msg = b"shutdown listener"
 
-        if comm_api == "tag":
-            close_msg_size = np.array([len(close_msg)], dtype=np.uint64)
+                if comm_api == "tag":
+                    close_msg_size = np.array([len(close_msg)], dtype=np.uint64)
 
-            await ep.send(close_msg_size)
-            await ep.send(close_msg)
-        else:
-            await ep.am_send(close_msg)
+                    await ep.send(close_msg_size)
+                    await ep.send(close_msg)
+                else:
+                    await ep.am_send(close_msg)
 
-        print_with_pid("Shutting Down Client...")
-        return msg["data"]
+                print_with_pid("Shutting Down Client...")
+                rx_cuda_obj = msg["data"]
 
-    loop = get_event_loop()
-    rx_cuda_obj = loop.run_until_complete(asyncio.wait_for(read(), timeout=timeout))
+    trio.run(main)
     rx_cuda_obj + rx_cuda_obj
     num_bytes = nbytes(rx_cuda_obj)
     print_with_pid(f"TOTAL DATA RECEIVED: {num_bytes}")
@@ -114,60 +118,65 @@ def server(port, func, comm_api, timeout):
     from distributed.comm.utils import to_frames
     from distributed.protocol import to_serialize
 
-    ucxx.init()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
 
-    async def f(listener_port):
-        # Coroutine shows up when the client asks to connect
-        async def write(ep):
-            print_with_pid("CREATING CUDA OBJECT IN SERVER...")
-            cuda_obj_generator = cloudpickle.loads(func)
-            cuda_obj = cuda_obj_generator()
-            msg = {"data": to_serialize(cuda_obj)}
-            frames = await to_frames(msg, serializers=("cuda", "dask", "pickle"))
-            for i in range(ITERATIONS):
-                print_with_pid(f"Server iteration {i}")
-                # Send meta data
-                if comm_api == "tag":
-                    await send(ep, frames)
-                else:
-                    while True:
-                        try:
-                            await am_send(ep, frames)
-                        except ucxx.exceptions.UCXNoMemoryError as e:
-                            # Memory pressure due to client taking too long to
-                            # receive will raise an exception.
-                            print_with_pid(f"Listener exception: {type(e)} {e}")
+            with trio.fail_after(timeout):
+                # Coroutine shows up when the client asks to connect
+                async def write(ep):
+                    print_with_pid("CREATING CUDA OBJECT IN SERVER...")
+                    cuda_obj_generator = cloudpickle.loads(func)
+                    cuda_obj = cuda_obj_generator()
+                    msg = {"data": to_serialize(cuda_obj)}
+                    frames = await to_frames(
+                        msg, serializers=("cuda", "dask", "pickle")
+                    )
+                    for i in range(ITERATIONS):
+                        print_with_pid(f"Server iteration {i}")
+                        # Send meta data
+                        if comm_api == "tag":
+                            await send(ep, frames)
                         else:
-                            break
+                            while True:
+                                try:
+                                    await am_send(ep, frames)
+                                except ucxx.exceptions.UCXNoMemoryError as e:
+                                    # Memory pressure due to client taking too long to
+                                    # receive will raise an exception.
+                                    print_with_pid(
+                                        f"Listener exception: {type(e)} {e}"
+                                    )
+                                else:
+                                    break
 
-            print_with_pid("CONFIRM RECEIPT")
-            close_msg = b"shutdown listener"
+                    print_with_pid("CONFIRM RECEIPT")
+                    close_msg = b"shutdown listener"
 
-            if comm_api == "tag":
-                msg_size = np.empty(1, dtype=np.uint64)
-                await ep.recv(msg_size)
+                    if comm_api == "tag":
+                        msg_size = np.empty(1, dtype=np.uint64)
+                        await ep.recv(msg_size)
 
-                msg = np.empty(msg_size[0], dtype=np.uint8)
-                await ep.recv(msg)
-            else:
-                msg = await ep.am_recv()
+                        msg = np.empty(msg_size[0], dtype=np.uint8)
+                        await ep.recv(msg)
+                    else:
+                        msg = await ep.am_recv()
 
-            recv_msg = msg.tobytes()
-            assert recv_msg == close_msg
-            print_with_pid("Shutting Down Server...")
-            await ep.close()
-            lf.close()
+                    recv_msg = msg.tobytes()
+                    assert recv_msg == close_msg
+                    print_with_pid("Shutting Down Server...")
+                    await ep.close()
+                    lf.close()
 
-        lf = ucxx.create_listener(write, port=listener_port)
-        await wait_listener_client_handlers(lf)
-        try:
-            while not lf.closed:
-                await asyncio.sleep(0.1)
-        except ucxx.UCXCloseError:
-            pass
+                lf = ucxx.create_listener(write, port=port)
+                await wait_listener_client_handlers(lf)
+                try:
+                    while not lf.closed:
+                        await trio.sleep(0.1)
+                except ucxx.UCXCloseError:
+                    pass
 
-    loop = get_event_loop()
-    loop.run_until_complete(asyncio.wait_for(f(port), timeout=timeout))
+    trio.run(main)
 
 
 def dataframe():

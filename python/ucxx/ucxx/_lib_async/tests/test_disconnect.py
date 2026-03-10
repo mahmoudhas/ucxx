@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import logging
 import multiprocessing as mp
 from io import StringIO
@@ -9,9 +8,9 @@ from queue import Empty
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
-from ucxx._lib_async.utils import get_event_loop
 from ucxx._lib_async.utils_test import (
     compute_timeouts,
     wait_listener_client_handlers,
@@ -27,7 +26,7 @@ async def mp_queue_get_nowait(queue):
             return queue.get_nowait()
         except Empty:
             pass
-        await asyncio.sleep(0.01)
+        await trio.sleep(0.01)
 
 
 def _test_shutdown_unexpected_closed_peer_server(
@@ -60,14 +59,19 @@ def _test_shutdown_unexpected_closed_peer_server(
         client_queue.put(listener.port)
         await wait_listener_client_handlers(listener)
         while not listener.closed:
-            await asyncio.sleep(0.1)
+            await trio.sleep(0.1)
 
     log_stream = StringIO()
     logging.basicConfig(stream=log_stream, level=logging.DEBUG)
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
         log = log_stream.getvalue()
 
         if endpoint_error_handling is True:
@@ -77,8 +81,6 @@ def _test_shutdown_unexpected_closed_peer_server(
             assert log.find("""UCXError('<[Send shutdown]""") != -1
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 def _test_shutdown_unexpected_closed_peer_client(
@@ -94,13 +96,16 @@ def _test_shutdown_unexpected_closed_peer_client(
         msg = np.empty(100, dtype=np.int64)
         await ep.recv(msg)
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 @pytest.mark.parametrize("endpoint_error_handling", [True, False])

@@ -93,4 +93,4 @@ select = [
 max_allowed_size_compressed = '10Mi'
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
+trio_mode = true

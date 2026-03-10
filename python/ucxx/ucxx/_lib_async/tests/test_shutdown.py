@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import logging
 import sys
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx as ucxx
 from ucxx._lib_async.utils_test import (
@@ -31,14 +31,16 @@ async def _shutdown_recv(ep, message_type):
         await ep.am_recv()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("message_type", ["tag", "am"])
 async def test_server_shutdown(message_type):
     """The server calls shutdown"""
 
     async def server_node(ep):
         with pytest.raises(ucxx.exceptions.UCXCanceledError):
-            await asyncio.gather(_shutdown_recv(ep, message_type), ep.close())
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(_shutdown_recv, ep, message_type)
+                nursery.start_soon(ep.close)
         await ep.close()
 
     async def client_node(port):
@@ -61,7 +63,7 @@ async def test_server_shutdown(message_type):
 @pytest.mark.skipif(
     sys.version_info < (3, 7), reason="test currently fails for python3.6"
 )
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("message_type", ["tag", "am"])
 async def test_client_shutdown(message_type):
     """The client calls shutdown"""
@@ -72,7 +74,9 @@ async def test_client_shutdown(message_type):
             port,
         )
         with pytest.raises(ucxx.exceptions.UCXCanceledError):
-            await asyncio.gather(_shutdown_recv(ep, message_type), ep.close())
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(_shutdown_recv, ep, message_type)
+                nursery.start_soon(ep.close)
         await ep.close()
 
     async def server_node(ep):
@@ -88,7 +92,7 @@ async def test_client_shutdown(message_type):
     listener.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("message_type", ["tag", "am"])
 async def test_listener_close(message_type):
     """The server close the listener"""
@@ -115,7 +119,7 @@ async def test_listener_close(message_type):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("message_type", ["tag", "am"])
 async def test_listener_del(message_type):
     """The client delete the listener"""
@@ -144,7 +148,7 @@ async def test_listener_del(message_type):
     await _shutdown_recv(ep, message_type)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("message_type", ["tag", "am"])
 async def test_close_after_n_recv(message_type):
     """The Endpoint.close_after_n_recv()"""

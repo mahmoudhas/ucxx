@@ -39,7 +39,7 @@ def make_echo_server(create_empty_data):
     return echo_server
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 async def test_send_recv_bytes(size):
     msg = bytearray(b"m" * size)
@@ -56,7 +56,7 @@ async def test_send_recv_bytes(size):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("dtype", dtypes)
 async def test_send_recv_numpy(size, dtype):
@@ -75,7 +75,7 @@ async def test_send_recv_numpy(size, dtype):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("dtype", dtypes)
 @pytest.mark.rerun_on_failure(3)
@@ -97,7 +97,7 @@ async def test_send_recv_cupy(size, dtype):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("dtype", dtypes)
 @pytest.mark.rerun_on_failure(3)
@@ -119,7 +119,7 @@ async def test_send_recv_numba(size, dtype):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.skip(reason="See https://github.com/rapidsai/ucxx/issues/104")
 async def test_send_recv_error():
     async def say_hey_server(ep):
@@ -142,7 +142,7 @@ async def test_send_recv_error():
     listener.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_send_recv_obj():
     async def echo_obj_server(ep):
         obj = await ep.recv_obj()
@@ -158,7 +158,7 @@ async def test_send_recv_obj():
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_send_recv_obj_numpy():
     allocator = functools.partial(np.empty, dtype=np.uint8)
 

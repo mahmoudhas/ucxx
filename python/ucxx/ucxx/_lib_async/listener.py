@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import inspect
 import logging
 import os
 import threading
 import weakref
+
+import trio
 
 import ucxx._lib.libucxx as ucx_api
 from ucxx.exceptions import UCXMessageTruncatedError
@@ -132,6 +133,16 @@ class Listener:
         """Closing the listener"""
         self._listener = None
 
+    async def aclose(self):
+        """Async close for use as ``async with``."""
+        self.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+
 
 async def _listener_handler_coroutine(
     conn_request,
@@ -142,9 +153,6 @@ async def _listener_handler_coroutine(
     ident,
     active_clients,
 ):
-    # def _listener_handler_coroutine(
-    #     conn_request, ctx, func, endpoint_error_handling, ident, active_clients
-    # ):
     # We create the Endpoint in five steps:
     #  1) Create endpoint from conn_request
     #  2) Generate unique IDs to use as tags
@@ -189,24 +197,22 @@ async def _listener_handler_coroutine(
     # Removing references here to avoid delayed clean up
     del ctx
 
-    # Finally, we call `func`
-    if inspect.iscoroutinefunction(func):
-        try:
-            await func(ep)
-        except Exception as e:
-            logger.error(f"Uncatched listener callback error {type(e)}: {e}")
-    else:
-        func(ep)
+    async with ep:
+        if inspect.iscoroutinefunction(func):
+            try:
+                await func(ep)
+            except Exception as e:
+                logger.error(f"Uncatched listener callback error {type(e)}: {e}")
+        else:
+            func(ep)
 
     active_clients.dec(ident)
-
-    # Ensure no references to `ep` remain to permit garbage collection.
-    del ep
 
 
 def _listener_handler(
     conn_request,
-    event_loop,
+    trio_token,
+    nursery,
     callback_func,
     ctx,
     endpoint_error_handling,
@@ -214,15 +220,28 @@ def _listener_handler(
     ident,
     active_clients,
 ):
-    asyncio.run_coroutine_threadsafe(
-        _listener_handler_coroutine(
-            conn_request,
-            ctx,
-            callback_func,
-            endpoint_error_handling,
-            connect_timeout,
-            ident,
-            active_clients,
-        ),
-        event_loop,
+    """Called when a new connection arrives.
+
+    In **thread** progress mode this is invoked from the C++ progress
+    thread, so we use ``trio.from_thread.run`` to cross into the trio
+    event loop.  In **polling/blocking** mode the callback fires from
+    within ``worker.progress()`` which already runs on the trio thread,
+    so we schedule directly via ``nursery.start_soon``.
+    """
+    handler_args = (
+        conn_request,
+        ctx,
+        callback_func,
+        endpoint_error_handling,
+        connect_timeout,
+        ident,
+        active_clients,
     )
+
+    try:
+        async def _spawn():
+            nursery.start_soon(_listener_handler_coroutine, *handler_args)
+
+        trio.from_thread.run(_spawn, trio_token=trio_token)
+    except RuntimeError:
+        nursery.start_soon(_listener_handler_coroutine, *handler_args)

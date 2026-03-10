@@ -3,10 +3,11 @@
 
 
 import array
-import asyncio
 import logging
 import warnings
 import weakref
+
+import trio
 
 import ucxx._lib.libucxx as ucx_api
 from ucxx._lib.arr import Array
@@ -131,6 +132,12 @@ class Endpoint:
         self._ep = None
         self._ctx = None
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.close()
+
     async def close(self, period=10**10, max_attempts=1):
         """Close the endpoint cleanly.
         This will attempt to flush outgoing buffers before actually
@@ -164,7 +171,7 @@ class Endpoint:
                 # Give all current outstanding send() calls a chance to return
                 if not self._ctx.progress_mode.startswith("thread"):
                     self._ctx.worker.progress()
-                await asyncio.sleep(0)
+                await trio.lowlevel.checkpoint()
                 self.abort(period=period, max_attempts=max_attempts)
 
     async def am_send(self, buffer):

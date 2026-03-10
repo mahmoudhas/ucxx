@@ -8,6 +8,8 @@ import warnings
 import weakref
 from queue import Queue
 
+import trio
+
 import ucxx._lib.libucxx as ucx_api
 from ucxx._lib.arr import Array
 from ucxx.exceptions import UCXMessageTruncatedError
@@ -18,36 +20,59 @@ from .endpoint import Endpoint
 from .exchange_peer_info import exchange_peer_info
 from .listener import ActiveClients, Listener, _listener_handler
 from .notifier_thread import _notifierThread
-from .utils import get_event_loop, hash64bits
+from .utils import hash64bits
 
 logger = logging.getLogger("ucx")
 
 
-ProgressTasks = dict()
+_progress_started = False
 
 
-def clear_progress_tasks():
-    global ProgressTasks
-    ProgressTasks.clear()
+def _reset_progress_flag():
+    global _progress_started
+    _progress_started = False
 
 
 class ApplicationContext:
     """
-    The context of the Asyncio interface of UCX.
+    The context of the trio interface of UCX.
+
+    Parameters
+    ----------
+    config_dict : dict
+        UCX configuration options.
+    nursery : trio.Nursery
+        A long-lived trio nursery used for spawning internal background
+        tasks (progress loop, connection handlers, etc.).  The nursery
+        must remain open for the lifetime of this context.
+    progress_mode : str or None
+        One of ``"thread"``, ``"thread-polling"``, ``"polling"``,
+        ``"blocking"``.  Defaults to ``"thread"``.
+    enable_delayed_submission : bool or None
+        Enable delayed request submission (requires thread progress).
+    connect_timeout : float or None
+        Timeout in seconds for endpoint peer-info exchange.
     """
 
     _progress_mode = None
     _enable_delayed_submission = None
-    _enable_python_future = None
 
     def __init__(
         self,
         config_dict={},
+        nursery=None,
         progress_mode=None,
         enable_delayed_submission=None,
-        enable_python_future=None,
         connect_timeout=None,
     ):
+        if nursery is None:
+            raise TypeError(
+                "ApplicationContext requires a trio nursery.  Pass "
+                "nursery=<trio.Nursery> so that background tasks can be "
+                "spawned."
+            )
+        self._nursery = nursery
+        self._trio_token = trio.lowlevel.current_trio_token()
         self.notifier_thread_q = None
         self.notifier_thread = None
         self._listener_active_clients = ActiveClients()
@@ -55,28 +80,24 @@ class ApplicationContext:
 
         self.progress_mode = progress_mode
         self.enable_delayed_submission = enable_delayed_submission
-        self.enable_python_future = enable_python_future
 
         if connect_timeout is None:
             self.connect_timeout = float(os.environ.get("UCXPY_CONNECT_TIMEOUT", 5))
         else:
             self.connect_timeout = connect_timeout
 
-        # For now, a application context only has one worker
         self.context = ucx_api.UCXContext(config_dict)
         self.worker = ucx_api.UCXWorker(
             self.context,
             enable_delayed_submission=self.enable_delayed_submission,
-            enable_python_future=self.enable_python_future,
+            enable_python_future=False,
         )
 
         self.start_notifier_thread()
 
-        weakref.finalize(self, clear_progress_tasks)
+        weakref.finalize(self, _reset_progress_flag)
 
-        # Ensure progress even before Endpoints get created, for example to
-        # receive messages directly on a worker after a remote endpoint
-        # connected with `create_endpoint_from_worker_address`.
+        # Ensure progress even before Endpoints get created.
         self.continuous_ucx_progress()
 
     @property
@@ -143,39 +164,6 @@ class ApplicationContext:
             )
 
     @property
-    def enable_python_future(self):
-        return self._enable_python_future
-
-    @enable_python_future.setter
-    def enable_python_future(self, enable_python_future):
-        if self._enable_python_future is None:
-            if enable_python_future is None:
-                if "UCXPY_ENABLE_PYTHON_FUTURE" in os.environ:
-                    explicit_enable_python_future = (
-                        os.environ["UCXPY_ENABLE_PYTHON_FUTURE"] != "0"
-                    )
-                else:
-                    explicit_enable_python_future = False
-            else:
-                explicit_enable_python_future = enable_python_future
-
-            if (
-                not self.progress_mode.startswith("thread")
-                and explicit_enable_python_future
-            ):
-                logger.warning(
-                    f"Notifier thread requested, but '{self.progress_mode}' does not "
-                    "support it, using Python wait_yield()."
-                )
-                explicit_enable_python_future = False
-
-            self._enable_python_future = explicit_enable_python_future
-        else:
-            raise RuntimeError(
-                "Enable Python future already set, modifying not allowed"
-            )
-
-    @property
     def config(self):
         """UCX configuration options as a dict."""
         return self.context.config
@@ -204,46 +192,33 @@ class ApplicationContext:
     def worker_address(self):
         return self.worker.address
 
-    def clear_progress_tasks(self) -> None:
-        global ProgressTasks
-        ProgressTasks.clear()
-
     def start_notifier_thread(self):
         if self.worker.enable_python_future and self.notifier_thread is None:
             logger.debug("UCXX_ENABLE_PYTHON available, enabling notifier thread")
-            loop = get_event_loop()
             self.notifier_thread_q = Queue()
             self.notifier_thread = threading.Thread(
                 target=_notifierThread,
-                args=(loop, self.worker, self.notifier_thread_q),
+                args=(self._trio_token, self.worker, self.notifier_thread_q),
                 name="UCX-Py Async Notifier Thread",
             )
             self.notifier_thread.start()
         else:
             logger.debug(
-                "UCXX not compiled with UCXX_ENABLE_PYTHON, disabling notifier thread"
+                "Python future disabled under trio, notifier thread not needed"
             )
 
     def stop_notifier_thread(self):
         """
-        Stop Python future notifier thread
-
-        Stop the notifier thread if context is running with Python future
-        notification enabled via `UCXPY_ENABLE_PYTHON_FUTURE=1` or
-        `ucxx.init(..., enable_python_future=True)`.
+        Stop Python future notifier thread.
 
         .. warning:: When the notifier thread is enabled it may be necessary to
-                     explicitly call this method before shutting down the process or
-                     or application, otherwise it may block indefinitely waiting for
-                     the thread to terminate. Executing `ucxx.reset()` will also run
-                     this method, so it's not necessary to have both.
+                     explicitly call this method before shutting down the process,
+                     otherwise it may block indefinitely waiting for the thread to
+                     terminate. Executing ``ucxx.reset()`` will also run this method.
         """
         if self.notifier_thread_q and self.notifier_thread:
             self.notifier_thread_q.put("shutdown")
             while True:
-                # Having a timeout is required. During the notifier thread shutdown
-                # it may require the GIL, which will cause a deadlock with the `join()`
-                # call otherwise.
                 self.notifier_thread.join(timeout=0.01)
                 if not self.notifier_thread.is_alive():
                     self.notifier_thread = None
@@ -282,12 +257,7 @@ class ApplicationContext:
             happen when disabled. If `False` endpoint endpoint error handling
             is disabled.
         connect_timeout: float
-            Timeout in seconds for exchanging peer info. In some cases, exchanging
-            peer information may hang indefinitely, a timeout prevents that. If the
-            chosen value is too high it may cause the operation to be stuck for too
-            long rather than quickly raising a `TimeoutError` that may be recovered
-            from by the application, but under high-load a higher timeout may
-            be helpful to prevent exchanging peer info from failing too fast.
+            Timeout in seconds for exchanging peer info.
 
         Returns
         -------
@@ -298,8 +268,6 @@ class ApplicationContext:
         if port is None:
             port = 0
 
-        loop = get_event_loop()
-
         logger.info("create_listener() - Start listening on port %d" % port)
         listener_id = self._next_listener_id
         self._next_listener_id += 1
@@ -309,7 +277,8 @@ class ApplicationContext:
                 port=port,
                 cb_func=_listener_handler,
                 cb_args=(
-                    loop,
+                    self._trio_token,
+                    self._nursery,
                     callback_func,
                     self,
                     endpoint_error_handling,
@@ -343,15 +312,9 @@ class ApplicationContext:
             If `True` (default) enable endpoint error handling raising
             exceptions when an error occurs, may incur in performance penalties
             but prevents a process from terminating unexpectedly that may
-            happen when disabled. If `False` endpoint endpoint error handling
-            is disabled.
+            happen when disabled.
         connect_timeout: float
-            Timeout in seconds for exchanging peer info. In some cases, exchanging
-            peer information may hang indefinitely, a timeout prevents that. If the
-            chosen value is too high it may cause the operation to be stuck for too
-            long rather than quickly raising a `TimeoutError` that may be recovered
-            from by the application, but under high-load a higher timeout may
-            be helpful to prevent exchanging peer info from failing too fast.
+            Timeout in seconds for exchanging peer info.
 
         Returns
         -------
@@ -366,10 +329,6 @@ class ApplicationContext:
         if not self.progress_mode.startswith("thread"):
             self.worker.progress()
 
-        # We create the Endpoint in three steps:
-        #  1) Generate unique IDs to use as tags
-        #  2) Exchange endpoint info such as tags
-        #  3) Use the info to create an endpoint
         seed = os.urandom(16)
         msg_tag = hash64bits("msg_tag", seed, ucx_ep.handle)
         try:
@@ -380,11 +339,7 @@ class ApplicationContext:
                 connect_timeout=connect_timeout,
             )
         except UCXMessageTruncatedError as e:
-            # A truncated message occurs if the remote endpoint closed before
-            # exchanging peer info, in that case we should raise the endpoint
-            # error, if available.
             ucx_ep.raise_on_error()
-            # If no endpoint error is available, re-raise exception.
             raise e
 
         tags = {
@@ -417,11 +372,7 @@ class ApplicationContext:
         ----------
         address: UCXAddress
         endpoint_error_handling: boolean, optional
-            If `True` (default) enable endpoint error handling raising
-            exceptions when an error occurs, may incur in performance penalties
-            but prevents a process from terminating unexpectedly that may
-            happen when disabled. If `False` endpoint endpoint error handling
-            is disabled.
+            If `True` (default) enable endpoint error handling.
 
         Returns
         -------
@@ -447,39 +398,33 @@ class ApplicationContext:
 
         return ep
 
-    def continuous_ucx_progress(self, event_loop=None):
-        """Guarantees continuous UCX progress
+    def continuous_ucx_progress(self):
+        """Guarantees continuous UCX progress.
 
-        Use this function to associate UCX progress with an event loop.
-        Notice, multiple event loops can be associate with UCX progress.
-
-        This function is automatically called when calling
-        `create_listener()` or `create_endpoint()`.
-
-        Parameters
-        ----------
-        event_loop: asyncio.event_loop, optional
-            The event loop to evoke UCX progress. If None,
-            `asyncio.get_event_loop()` (`asyncio.new_event_loop()` in
-            Python 3.10+) is used.
+        This is called automatically when calling ``create_listener()``
+        or ``create_endpoint()``.  Background tasks are spawned into the
+        nursery that was passed to the constructor.
         """
-        loop = event_loop if event_loop is not None else get_event_loop()
-        global ProgressTasks
-        if loop in ProgressTasks:
-            return  # Progress has already been guaranteed for the current event loop
+        global _progress_started
+        if _progress_started:
+            return
 
         logger.info(f"Starting progress in '{self.progress_mode}' mode")
 
         if self.progress_mode == "thread":
-            task = ThreadMode(self.worker, loop, polling_mode=False)
+            self._progress_task = ThreadMode(
+                self.worker, self._nursery, polling_mode=False
+            )
         elif self.progress_mode == "thread-polling":
-            task = ThreadMode(self.worker, loop, polling_mode=True)
+            self._progress_task = ThreadMode(
+                self.worker, self._nursery, polling_mode=True
+            )
         elif self.progress_mode == "polling":
-            task = PollingMode(self.worker, loop)
+            self._progress_task = PollingMode(self.worker, self._nursery)
         elif self.progress_mode == "blocking":
-            task = BlockingMode(self.worker, loop)
+            self._progress_task = BlockingMode(self.worker, self._nursery)
 
-        ProgressTasks[loop] = task
+        _progress_started = True
 
     def get_ucp_worker(self):
         """Returns the underlying UCP worker handle (ucp_worker_h)
@@ -533,43 +478,29 @@ class ApplicationContext:
     def tag_probe(self, tag, remove=False):
         """Probe for tag messages directly on worker without a local Endpoint.
 
-        This method checks if a message with the specified tag is available
-        without actually receiving it. This is useful for non-blocking
-        message checking.
-
         Parameters
         ----------
         tag: hashable
             Set a tag that must match the received message.
         remove: bool
-            If true, remove the message from the queue and return a
-            message handle for efficient reception. If false, leave
-            the message in the queue.
+            If true, remove the message from the queue.
 
         Returns
         -------
         TagProbeResult
-            A result object containing:
-            - matched: bool indicating if a message was found
-            - sender_tag: int sender tag (when matched=True)
-            - length: int message length in bytes (when matched=True)
-            - handle: int message handle for efficient reception (when matched=True and
-                      remove=True)
         """
         if not isinstance(tag, Tag):
             tag = Tag(tag)
 
         return self.worker.tag_probe(tag, remove=remove)
 
-    # @ucx_api.nvtx_annotate("UCXPY_WORKER_RECV", color="red", domain="ucxpy")
     async def recv(self, buffer, tag):
         """Receive directly on worker without a local Endpoint into `buffer`.
 
         Parameters
         ----------
         buffer: exposing the buffer protocol or array/cuda interface
-            The buffer to receive into. Raise ValueError if buffer
-            is smaller than nbytes or read-only.
+            The buffer to receive into.
         tag: hashable, optional
             Set a tag that must match the received message.
         """
@@ -592,14 +523,10 @@ class ApplicationContext:
     async def recv_with_handle(self, buffer, probe_result):
         """Receive tag message using message handle obtained from tag_probe.
 
-        This is more efficient than regular recv as it doesn't need to go through
-        the message matching queue again.
-
         Parameters
         ----------
         buffer: exposing the buffer protocol or array/cuda interface
-            The buffer to receive into. Raise ValueError if buffer
-            is smaller than nbytes or read-only.
+            The buffer to receive into.
         probe_result: TagProbeResult
             The probe result obtained from tag_probe with remove=True.
 

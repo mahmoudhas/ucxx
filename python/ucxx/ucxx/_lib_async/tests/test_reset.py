@@ -20,7 +20,7 @@ class ResetAfterN:
             ucxx.reset()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_reset():
     reset = ResetAfterN(2)
 
@@ -36,7 +36,7 @@ async def test_reset():
     reset()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_lt_still_in_scope_error():
     reset = ResetAfterN(2)
 
@@ -58,7 +58,7 @@ async def test_lt_still_in_scope_error():
     lt.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_ep_still_in_scope_error():
     reset = ResetAfterN(2)
 

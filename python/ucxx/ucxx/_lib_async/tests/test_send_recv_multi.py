@@ -36,7 +36,7 @@ def make_echo_server():
     return echo_server
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("multi_size", multi_sizes)
 async def test_send_recv_bytes(size, multi_size):
@@ -52,7 +52,7 @@ async def test_send_recv_bytes(size, multi_size):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("multi_size", multi_sizes)
 @pytest.mark.parametrize("dtype", dtypes)
@@ -68,7 +68,7 @@ async def test_send_recv_numpy(size, multi_size, dtype):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("multi_size", multi_sizes)
 @pytest.mark.parametrize("dtype", dtypes)
@@ -87,7 +87,7 @@ async def test_send_recv_cupy(size, multi_size, dtype):
     await wait_listener_client_handlers(listener)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("multi_size", multi_sizes)
 @pytest.mark.parametrize("dtype", dtypes)

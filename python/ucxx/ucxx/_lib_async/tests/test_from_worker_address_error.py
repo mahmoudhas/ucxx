@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import multiprocessing as mp
 import os
 import re
@@ -9,9 +8,9 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
-from ucxx._lib_async.utils import get_event_loop
 from ucxx._lib_async.utils_test import compute_timeouts
 from ucxx.testing import join_processes, terminate_process
 
@@ -23,13 +22,9 @@ def _test_from_worker_address_error_server(q1, q2, error_type, timeout):
         address = bytearray(ucxx.get_worker_address())
 
         if error_type == "unreachable":
-            # Shutdown worker, then send its address to client process via
-            # multiprocessing.Queue
             ucxx.reset()
             q1.put(address)
         else:
-            # Send worker address to client process via # multiprocessing.Queue,
-            # wait for client to connect, then shutdown worker.
             q1.put(address)
 
             ep_ready = q2.get()
@@ -37,20 +32,20 @@ def _test_from_worker_address_error_server(q1, q2, error_type, timeout):
 
             ucxx.reset()
 
-            # q1.put("disconnected")
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
 
-    loop = get_event_loop()
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 def _test_from_worker_address_error_client(q1, q2, error_type, timeout):
     async def run():
-        # Receive worker address from server via multiprocessing.Queue
         remote_address = ucxx.get_ucx_address_from_buffer(q1.get())
         if error_type == "unreachable":
             server_closed = q1.get()
@@ -61,91 +56,65 @@ def _test_from_worker_address_error_client(q1, q2, error_type, timeout):
                 ucxx.exceptions.UCXError,
                 match="Destination is unreachable|Endpoint timeout",
             ):
-                # Here, two cases may happen:
-                # 1. With TCP creating endpoint will immediately raise
-                #    "Destination is unreachable"
-                # 2. With rc/ud creating endpoint will succeed, but raise
-                #    "Endpoint timeout" after UCX_UD_TIMEOUT seconds have passed.
-                #    We need to keep progressing ucxx until timeout is raised.
                 ep = await ucxx.create_endpoint_from_worker_address(remote_address)
                 while ep.alive:
-                    await asyncio.sleep(0)
+                    await trio.sleep(0)
                     if not ucxx.core._get_ctx().progress_mode.startswith("thread"):
                         ucxx.progress()
                 ep._ep.raise_on_error()
         else:
-            # Create endpoint to remote worker, and:
-            #
-            # 1. For timeout_am_send/timeout_send:
-            #    - inform remote worker that local endpoint is ready for remote
-            #      shutdown;
-            #    - wait for remote worker to shutdown and confirm;
-            #    - attempt to send message.
-            #
-            # 2. For timeout_am_recv/timeout_recv:
-            #    - schedule ep.recv;
-            #    - inform remote worker that local endpoint is ready for remote
-            #      shutdown;
-            #    - wait for it to shutdown and confirm
-            #    - wait for recv message.
             ep = await ucxx.create_endpoint_from_worker_address(remote_address)
 
             if re.match("timeout.*send", error_type):
                 q2.put("ready")
 
-                # Wait for remote endpoint to disconnect
                 while ep.alive:
-                    await asyncio.sleep(0)
+                    await trio.sleep(0)
                     if not ucxx.core._get_ctx().progress_mode.startswith("thread"):
                         ucxx.progress()
 
-                # TCP generally raises `UCXConnectionResetError`, whereas InfiniBand
-                # raises `UCXEndpointTimeoutError`
                 with pytest.raises(
                     (
                         ucxx.exceptions.UCXConnectionResetError,
                         ucxx.exceptions.UCXEndpointTimeoutError,
                     )
                 ):
-                    if error_type == "timeout_am_send":
-                        await asyncio.wait_for(ep.am_send(np.zeros(10)), timeout=1.0)
-                    else:
-                        await asyncio.wait_for(
-                            ep.send(np.zeros(10), tag=0, force_tag=True), timeout=1.0
-                        )
+                    with trio.fail_after(1.0):
+                        if error_type == "timeout_am_send":
+                            await ep.am_send(np.zeros(10))
+                        else:
+                            await ep.send(np.zeros(10), tag=0, force_tag=True)
             else:
-                # TCP generally raises `UCXConnectionResetError`, whereas InfiniBand
-                # raises `UCXEndpointTimeoutError`
                 with pytest.raises(
                     (
                         ucxx.exceptions.UCXConnectionResetError,
                         ucxx.exceptions.UCXEndpointTimeoutError,
                     )
                 ):
-                    if error_type == "timeout_am_recv":
-                        task = asyncio.wait_for(ep.am_recv(), timeout=3.0)
-                    else:
-                        msg = np.empty(10)
-                        task = asyncio.wait_for(
-                            ep.recv(msg, tag=0, force_tag=True), timeout=3.0
-                        )
-
                     q2.put("ready")
 
                     while ep.alive:
-                        await asyncio.sleep(0)
+                        await trio.sleep(0)
                         if not ucxx.core._get_ctx().progress_mode.startswith("thread"):
                             ucxx.progress()
 
-                    await task
+                    with trio.fail_after(3.0):
+                        if error_type == "timeout_am_recv":
+                            await ep.am_recv()
+                        else:
+                            msg = np.empty(10)
+                            await ep.recv(msg, tag=0, force_tag=True)
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 @pytest.mark.parametrize(

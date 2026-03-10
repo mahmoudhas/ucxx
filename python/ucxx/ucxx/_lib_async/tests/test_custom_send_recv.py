@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import pickle
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
 from ucxx._lib_async.utils_test import wait_listener_client_handlers
@@ -15,7 +15,7 @@ distributed = pytest.importorskip("distributed")
 cuda = pytest.importorskip("numba.cuda")
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize(
     "g",
     [
@@ -110,9 +110,19 @@ async def test_send_recv_cudf(g):
     uu.address = ucxx.get_address()
     uu.client = await ucxx.create_endpoint(uu.address, uu.ucxx_server.port)
     ucx = UCX(uu.client)
-    await asyncio.sleep(0.2)
+    await trio.sleep(0.2)
     msg = g(cudf)
-    frames, _ = await asyncio.gather(uu.comm.read(), ucx.write(msg))
+
+    results = [None, None]
+
+    async def run_and_store(idx, coro):
+        results[idx] = await coro
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(run_and_store, 0, uu.comm.read())
+        nursery.start_soon(run_and_store, 1, ucx.write(msg))
+
+    frames = results[0]
     ucx_header = pickle.loads(frames[0])
     cudf_buffer = frames[1:]
     typ = type(msg)

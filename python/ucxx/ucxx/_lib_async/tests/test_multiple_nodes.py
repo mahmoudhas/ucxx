@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
-
 import numpy as np
 import pytest
+import trio
 
 import ucxx
 from ucxx._lib_async.utils_test import wait_listener_client_handlers
@@ -38,7 +37,7 @@ async def client_node(port):
     # assert isinstance(ep.ucx_info(), str)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("num_servers", [1, 2, 4])
 @pytest.mark.parametrize("num_clients", [1, 10, 50, 100])
 async def test_many_servers_many_clients(num_servers, num_clients):
@@ -52,10 +51,9 @@ async def test_many_servers_many_clients(num_servers, num_clients):
     # We ensure no more than `somaxconn` connections are submitted
     # at once. Doing otherwise can block and hang indefinitely.
     for i in range(0, num_clients * num_servers, somaxconn):
-        clients = []
-        for __ in range(i, min(i + somaxconn, num_clients * num_servers)):
-            clients.append(client_node(listeners[__ % num_servers].port))
-        await asyncio.gather(*clients)
-    await asyncio.gather(
-        *(wait_listener_client_handlers(listener) for listener in listeners)
-    )
+        async with trio.open_nursery() as nursery:
+            for __ in range(i, min(i + somaxconn, num_clients * num_servers)):
+                nursery.start_soon(client_node, listeners[__ % num_servers].port)
+    async with trio.open_nursery() as nursery:
+        for listener in listeners:
+            nursery.start_soon(wait_listener_client_handlers, listener)

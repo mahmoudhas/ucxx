@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import multiprocessing as mp
 import os
 import struct
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
-from ucxx._lib_async.utils import get_event_loop, hash64bits
+from ucxx._lib_async.utils import hash64bits
 from ucxx._lib_async.utils_test import compute_timeouts
 from ucxx.testing import join_processes, terminate_process
 
@@ -19,64 +19,60 @@ mp = mp.get_context("spawn")
 
 def _test_from_worker_address_server(queue, timeout):
     async def run():
-        # Send worker address to client process via multiprocessing.Queue
         address = ucxx.get_worker_address()
         queue.put(address)
 
-        # Receive address size
         address_size = np.empty(1, dtype=np.int64)
         await ucxx.recv(address_size, tag=0)
 
-        # Receive address buffer on tag 0 and create UCXAddress from it
         remote_address = bytearray(address_size[0])
         await ucxx.recv(remote_address, tag=0)
         remote_address = ucxx.get_ucx_address_from_buffer(remote_address)
 
-        # Create endpoint to remote worker using the received address
         ep = await ucxx.create_endpoint_from_worker_address(remote_address)
 
-        # Send data to client's endpoint
         send_msg = np.arange(10, dtype=np.int64)
         await ep.send(send_msg, tag=1, force_tag=True)
         await ep.close()
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 def _test_from_worker_address_client(queue, timeout):
     async def run():
-        # Read local worker address
         address = ucxx.get_worker_address()
 
-        # Receive worker address from server via multiprocessing.Queue, create
-        # endpoint to server
         remote_address = queue.get()
         ep = await ucxx.create_endpoint_from_worker_address(remote_address)
 
-        # Send local address to server on tag 0
         await ep.send(np.array(address.length, np.int64), tag=0, force_tag=True)
         await ep.send(address, tag=0, force_tag=True)
 
-        # Receive message from server
         recv_msg = np.empty(10, dtype=np.int64)
         await ep.recv(recv_msg, tag=1, force_tag=True)
         await ep.close()
 
         np.testing.assert_array_equal(recv_msg, np.arange(10, dtype=np.int64))
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 def test_from_worker_address(pytestconfig):
@@ -165,85 +161,77 @@ def _unpack_address_and_tag(address_packed):
 def _test_from_worker_address_server_fixedsize(num_nodes, queue, timeout):
     async def run():
         async def _handle_client(packed_remote_address):
-            # Unpack the fixed-size address+tag buffer
             unpacked = _unpack_address_and_tag(packed_remote_address)
             remote_address = ucxx.get_ucx_address_from_buffer(unpacked["address"])
 
-            # Create endpoint to remote worker using the received address
             ep = await ucxx.create_endpoint_from_worker_address(remote_address)
 
-            # Send data to client's endpoint
             send_msg = np.arange(10, dtype=np.int64)
             await ep.send(send_msg, tag=unpacked["send_tag"], force_tag=True)
 
-            # Receive data from client's endpoint
             recv_msg = np.empty(20, dtype=np.int64)
             await ep.recv(recv_msg, tag=unpacked["recv_tag"], force_tag=True)
 
             np.testing.assert_array_equal(recv_msg, np.arange(20, dtype=np.int64))
 
-        # Send worker address to client processes via multiprocessing.Queue,
-        # one entry for each client.
         address = ucxx.get_worker_address()
         for i in range(num_nodes):
             queue.put(address)
 
         address_info = _get_address_info()
 
-        server_tasks = []
+        packed_addresses = []
         for i in range(num_nodes):
-            # Receive fixed-size address+tag buffer on tag 0
             packed_remote_address = bytearray(address_info["frame_size"])
             await ucxx.recv(packed_remote_address, tag=0)
+            packed_addresses.append(packed_remote_address)
 
-            # Create an async task for client
-            server_tasks.append(_handle_client(packed_remote_address))
+        async with trio.open_nursery() as inner:
+            for packed in packed_addresses:
+                inner.start_soon(_handle_client, packed)
 
-        # Await handling each client request
-        await asyncio.gather(*server_tasks)
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
 
-    loop = get_event_loop()
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 def _test_from_worker_address_client_fixedsize(queue, timeout):
     async def run():
-        # Read local worker address
         address = ucxx.get_worker_address()
         recv_tag = hash64bits(os.urandom(16))
         send_tag = hash64bits(os.urandom(16))
         packed_address = _pack_address_and_tag(address, recv_tag, send_tag)
 
-        # Receive worker address from server via multiprocessing.Queue, create
-        # endpoint to server
         remote_address = queue.get()
         ep = await ucxx.create_endpoint_from_worker_address(remote_address)
 
-        # Send local address to server on tag 0
         await ep.send(packed_address, tag=0, force_tag=True)
 
-        # Receive message from server
         recv_msg = np.empty(10, dtype=np.int64)
         await ep.recv(recv_msg, tag=recv_tag, force_tag=True)
 
         np.testing.assert_array_equal(recv_msg, np.arange(10, dtype=np.int64))
 
-        # Send message to server
         send_msg = np.arange(20, dtype=np.int64)
         await ep.send(send_msg, tag=send_tag, force_tag=True)
 
-    loop = get_event_loop()
+    async def main():
+        async with trio.open_nursery() as nursery:
+            ucxx.core._init_with_nursery(nursery=nursery)
+            with trio.fail_after(timeout):
+                await run()
+
     try:
-        loop.run_until_complete(asyncio.wait_for(run(), timeout=timeout))
+        trio.run(main)
     finally:
         ucxx.stop_notifier_thread()
-
-        loop.close()
 
 
 @pytest.mark.slow

@@ -29,20 +29,21 @@ def test_set_env():
 
 
 @patch.dict(os.environ, {"UCX_SEG_SIZE": "2M"})
-def test_init_options():
+@pytest.mark.trio
+async def test_init_options():
     ucxx.reset()
     options = {"SEG_SIZE": "3M"}
-    # environment specification should be ignored
-    ucxx.init(options)
+    ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
     config = ucxx.get_config()
     assert config["SEG_SIZE"] == options["SEG_SIZE"]
 
 
 @patch.dict(os.environ, {"UCX_SEG_SIZE": "4M"})
-def test_init_options_and_env():
+@pytest.mark.trio
+async def test_init_options_and_env():
     ucxx.reset()
     options = {"SEG_SIZE": "3M"}  # Should be ignored
-    ucxx.init(options, env_takes_precedence=True)
+    ucxx.core._init_with_nursery(options, env_takes_precedence=True, nursery=ucxx.core._test_nursery)
     config = ucxx.get_config()
     assert config["SEG_SIZE"] == os.environ["UCX_SEG_SIZE"]
     # Provided options dict was not modified.
@@ -55,22 +56,25 @@ def test_init_options_and_env():
     "UCP options but not options from other modules such as UCT. "
     "See https://github.com/openucx/ucx/issues/7519.",
 )
-def test_init_unknown_option():
+@pytest.mark.trio
+async def test_init_unknown_option():
     ucxx.reset()
     options = {"UNKNOWN_OPTION": "3M"}
     with pytest.raises(ucxx.exceptions.UCXInvalidParamError):
-        ucxx.init(options)
+        ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
 
 
-def test_init_invalid_option():
+@pytest.mark.trio
+async def test_init_invalid_option():
     ucxx.reset()
     options = {"SEG_SIZE": "invalid-size"}
     with pytest.raises(ucxx.exceptions.UCXInvalidParamError):
-        ucxx.init(options)
+        ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
 
 
 @patch.dict(os.environ, {"UCX_SEG_SIZE": "2M"})
-def test_logging():
+@pytest.mark.trio
+async def test_logging():
     """
     Test default logging configuration.
     """
@@ -82,12 +86,12 @@ def test_logging():
     with captured_logger(root, level=logging.INFO) as foreign_log:
         ucxx.reset()
         options = {"SEG_SIZE": "3M"}
-        ucxx.init(options)
+        ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
     assert len(foreign_log.getvalue()) > 0
 
     with captured_logger(root, level=logging.ERROR) as foreign_log:
         ucxx.reset()
         options = {"SEG_SIZE": "3M"}
-        ucxx.init(options)
+        ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
 
     assert len(foreign_log.getvalue()) == 0

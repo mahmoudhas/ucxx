@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
+import trio
 from functools import partial
 
 import pytest
@@ -20,7 +20,7 @@ async def _server_node(ep, listener=None, coroutine=None):
     # Wait for remote endpoint to close before probing the endpoint for
     # in-transit message and receiving it.
     while not ep.closed:
-        await asyncio.sleep(0)  # Yield task
+        await trio.sleep(0)  # Yield task
 
     received = await coroutine(ep)
 
@@ -103,7 +103,7 @@ async def _client_node(probe_type, port):
     await ep.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("api_type", ["endpoint", "context"])
 @pytest.mark.parametrize("probe_type", ["am", "tag", "tag_remove"])
 async def test_message_probe(api_type, probe_type):
@@ -140,4 +140,4 @@ async def test_message_probe(api_type, probe_type):
 
     wait_listener_client_handlers(Listener)
     while not Listener.closed:
-        await asyncio.sleep(0.01)
+        await trio.sleep(0.01)

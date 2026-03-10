@@ -23,17 +23,18 @@ def test_worker_info():
     assert isinstance(info, str)
 
 
+@pytest.mark.trio
 @pytest.mark.parametrize(
     "transports",
     ["self", "tcp", "self,tcp"],
 )
-def test_check_transport(transports):
+async def test_check_transport(transports):
     transports_list = transports.split(",")
     inactive_transports = list(set(["self", "tcp"]) - set(transports_list))
 
     ucxx.reset()
     options = {"TLS": transports, "NET_DEVICES": "all"}
-    ucxx.init(options)
+    ucxx.core._init_with_nursery(options, nursery=ucxx.core._test_nursery)
 
     active_transports = ucxx.get_active_transports()
     for t in transports_list:

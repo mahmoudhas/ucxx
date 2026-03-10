@@ -9,7 +9,7 @@ import pytest
 import ucxx
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("enable_delayed_submission", [True, False])
 @pytest.mark.parametrize("enable_python_future", [True, False])
 async def test_worker_capabilities_args(
@@ -19,14 +19,16 @@ async def test_worker_capabilities_args(
 
     if enable_delayed_submission and not progress_mode.startswith("thread"):
         with pytest.raises(ValueError, match="Delayed submission requested, but"):
-            ucxx.init(
+            ucxx.core._init_with_nursery(
                 enable_delayed_submission=enable_delayed_submission,
                 enable_python_future=enable_python_future,
+                nursery=ucxx.core._test_nursery,
             )
     else:
-        ucxx.init(
+        ucxx.core._init_with_nursery(
             enable_delayed_submission=enable_delayed_submission,
             enable_python_future=enable_python_future,
+            nursery=ucxx.core._test_nursery,
         )
 
         worker = ucxx.core._get_ctx().worker
@@ -38,7 +40,7 @@ async def test_worker_capabilities_args(
             assert worker.enable_python_future is False
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("enable_delayed_submission", [True, False])
 @pytest.mark.parametrize("enable_python_future", [True, False])
 async def test_worker_capabilities_env(enable_delayed_submission, enable_python_future):
@@ -54,10 +56,12 @@ async def test_worker_capabilities_env(enable_delayed_submission, enable_python_
         progress_mode = os.getenv("UCXPY_PROGRESS_MODE", "thread")
 
         if enable_delayed_submission and not progress_mode.startswith("thread"):
-            with pytest.raises(ValueError, match="Delayed submission requested, but"):
-                ucxx.init()
+            with pytest.raises(
+                ValueError, match="Delayed submission requested, but"
+            ):
+                ucxx.core._init_with_nursery(nursery=ucxx.core._test_nursery)
         else:
-            ucxx.init()
+            ucxx.core._init_with_nursery(nursery=ucxx.core._test_nursery)
 
             worker = ucxx.core._get_ctx().worker
 

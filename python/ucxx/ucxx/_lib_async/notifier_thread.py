@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
-import asyncio
 import logging
 from concurrent.futures import TimeoutError
+
+import trio
 
 import ucxx._lib.libucxx as ucx_api
 
@@ -15,21 +16,8 @@ async def _run_request_notifier(worker):
     return worker.run_request_notifier()
 
 
-async def _notifier_coroutine(worker):
-    worker.populate_python_futures_pool()
-    finished = worker.wait_request_notifier()
-    if finished:
-        return True
-
-    # Notify all enqueued waiting futures
-    await _run_request_notifier(worker)
-
-    return False
-
-
-def _notifierThread(event_loop, worker, q):
+def _notifierThread(trio_token, worker, q):
     logger.debug("Starting Notifier Thread")
-    asyncio.set_event_loop(event_loop)
     shutdown = False
 
     while True:
@@ -51,17 +39,12 @@ def _notifierThread(event_loop, worker, q):
         elif state == ucx_api.PythonRequestNotifierWaitState.Timeout:
             continue
 
-        # Notify all enqueued waiting futures
-        task = asyncio.run_coroutine_threadsafe(
-            _run_request_notifier(worker), event_loop
-        )
         try:
-            task.result(0.01)
+            trio.from_thread.run(
+                _run_request_notifier, worker, trio_token=trio_token
+            )
         except TimeoutError:
-            # Do NOT cancel the task here. run_request_notifier() sets asyncio
-            # Futures for completed UCX requests; cancelling leaves them unset and
-            # causes send/recv to hang.
-            logger.debug("Notifier Thread Result Timeout (task left scheduled)")
+            logger.debug("Notifier Thread Result Timeout")
         except Exception as e:
             logger.debug(f"Notifier Thread Result Exception: {e}")
 

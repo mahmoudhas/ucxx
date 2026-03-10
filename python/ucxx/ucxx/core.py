@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import contextlib
 import gc
 import logging
 import os
@@ -17,54 +18,33 @@ logger = logging.getLogger("ucx")
 # However, the init of CUDA must happen after all process forks thus we delay
 # the instantiation of the application context to the first use of the API.
 _ctx = None
+_test_nursery = None
 
 
 def _get_ctx():
     global _ctx
     if _ctx is None:
-        _ctx = ApplicationContext()
+        if _test_nursery is not None:
+            _init_with_nursery(nursery=_test_nursery)
+        else:
+            raise RuntimeError(
+                "UCX is not initialized.  "
+                "Use ``async with ucxx.init(): ...``"
+            )
     return _ctx
 
 
-# The following functions initialize and use a single ApplicationContext instance
-
-
-def init(
+def _init_with_nursery(
     options={},
     env_takes_precedence=False,
+    nursery=None,
     progress_mode=None,
     enable_delayed_submission=None,
-    enable_python_future=None,
     connect_timeout=None,
 ):
-    """Initiate UCX.
+    """Low-level init that takes an already-open nursery.
 
-    Usually this is done automatically at the first API call
-    but this function makes it possible to set UCX options programmable.
-    Alternatively, UCX options can be specified through environment variables.
-
-    Parameters
-    ----------
-    options: dict, optional
-        UCX options send to the underlying UCX library
-    env_takes_precedence: bool, optional
-        Whether environment variables takes precedence over the `options`
-        specified here.
-    progress_mode: string, optional
-        If None, thread UCX progress mode is used unless the environment variable
-        `UCXPY_PROGRESS_MODE` is defined. Otherwise the options are 'blocking',
-        'polling', 'thread'.
-    enable_delayed_submission: boolean, optional
-        If None, delayed submission is disabled unless
-        `UCXPY_ENABLE_DELAYED_SUBMISSION` is defined with a value other than `0`.
-    enable_python_future: boolean, optional
-        If None, request notification via Python futures is disabled unless
-        `UCXPY_ENABLE_PYTHON_FUTURE` is defined with a value other than `0`.
-    connect_timeout: float, optional
-        The timeout in seconds for exchanging endpoint information upon endpoint
-        establishment. If None, use the value from `UCXPY_CONNECT_TIMEOUT` if defined,
-        otherwise fallback to the default of 5 seconds.
-
+    Prefer the public ``async with ucxx.init(): ...`` API instead.
     """
     global _ctx
     if _ctx is not None:
@@ -72,6 +52,7 @@ def init(
             "UCX is already initiated. Call reset() and init() "
             "in order to re-initate UCX with new options."
         )
+
     options = options.copy()
     for k, v in options.items():
         env_k = f"UCX_{k}"
@@ -89,17 +70,69 @@ def init(
 
     _ctx = ApplicationContext(
         options,
+        nursery=nursery,
         progress_mode=progress_mode,
         enable_delayed_submission=enable_delayed_submission,
-        enable_python_future=enable_python_future,
         connect_timeout=connect_timeout,
     )
+
+
+@contextlib.asynccontextmanager
+async def init(
+    options={},
+    env_takes_precedence=False,
+    progress_mode=None,
+    enable_delayed_submission=None,
+    connect_timeout=None,
+):
+    """Initialise UCX and yield control.
+
+    Use as an async context manager::
+
+        async with ucxx.init():
+            listener = ucxx.create_listener(handler, port=0)
+            ...
+
+    A trio nursery is created and managed internally for background
+    tasks (progress loop, connection handlers).  ``reset()`` is called
+    automatically when the block exits.
+
+    Parameters
+    ----------
+    options : dict, optional
+        UCX options sent to the underlying UCX library.
+    env_takes_precedence : bool, optional
+        Whether environment variables take precedence over *options*.
+    progress_mode : str, optional
+        ``'thread'`` (default), ``'thread-polling'``, ``'polling'``,
+        or ``'blocking'``.
+    enable_delayed_submission : bool, optional
+        Enable delayed request submission (requires thread progress).
+    connect_timeout : float, optional
+        Timeout in seconds for endpoint peer-info exchange.
+    """
+    import trio
+
+    async with trio.open_nursery() as nursery:
+        _init_with_nursery(
+            options=options,
+            env_takes_precedence=env_takes_precedence,
+            nursery=nursery,
+            progress_mode=progress_mode,
+            enable_delayed_submission=enable_delayed_submission,
+            connect_timeout=connect_timeout,
+        )
+        try:
+            yield
+        finally:
+            reset()
+            nursery.cancel_scope.cancel()
 
 
 def reset():
     """Resets the UCX library by shutting down all of UCX.
 
-    The library is initiated at next API call.
+    The library is initiated at next ``init()`` call.
     """
     stop_notifier_thread()
     global _ctx
@@ -226,8 +259,8 @@ def get_active_transports():
     return set([r.split()[-1].split("/")[0] for r in resources])
 
 
-def continuous_ucx_progress(event_loop=None):
-    _get_ctx().continuous_ucx_progress(event_loop=event_loop)
+def continuous_ucx_progress():
+    _get_ctx().continuous_ucx_progress()
 
 
 def get_ucp_worker():

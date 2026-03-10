@@ -7,7 +7,7 @@ import ucxx
 from ucxx._lib_async.utils_test import wait_listener_client_handlers
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_ucp_worker():
     worker = ucxx.get_ucp_worker()
     assert isinstance(worker, int)
@@ -22,7 +22,7 @@ async def test_get_ucp_worker():
     await wait_listener_client_handlers(lt)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_ucp_endpoint():
     async def server(ep):
         ucp_ep = ep.ucp_endpoint
@@ -38,7 +38,7 @@ async def test_get_ucp_endpoint():
     await wait_listener_client_handlers(lt)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_ucxx_worker():
     worker = ucxx.get_ucxx_worker()
     assert isinstance(worker, int)
@@ -53,7 +53,7 @@ async def test_get_ucxx_worker():
     await wait_listener_client_handlers(lt)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_get_ucxx_endpoint():
     async def server(ep):
         ucxx_ep = ep.ucxx_endpoint

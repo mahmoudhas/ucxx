@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 from queue import Empty, Queue
 
 import pytest
+import trio
 
 import ucxx
 from ucxx._lib_async.utils_test import wait_listener_client_handlers
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.flaky(
     reruns=3,
     only_rerun="Trying to reset UCX but not all Endpoints and/or Listeners are closed",
@@ -52,10 +52,10 @@ async def test_close_callback(server_close_callback):
     await client_node(listener.port)
     await wait_listener_client_handlers(listener)
     while closed[0] is False:
-        await asyncio.sleep(0.01)
+        await trio.sleep(0.01)
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("transfer_api", ["am", "tag", "tag_multi"])
 async def test_cancel(transfer_api):
     q = Queue()
@@ -69,29 +69,34 @@ async def test_cancel(transfer_api):
                 q.get(timeout=0.01)
                 return
             except Empty:
-                await asyncio.sleep(0)
+                await trio.sleep(0)
 
     async def client_node(port):
         ep = await ucxx.create_endpoint(ucxx.get_address(), port)
-        try:
-            if transfer_api == "am":
-                _, pending = await asyncio.wait(
-                    [asyncio.create_task(ep.am_recv())], timeout=0.001
-                )
-            elif transfer_api == "tag":
-                msg = bytearray(1)
-                _, pending = await asyncio.wait(
-                    [asyncio.create_task(ep.recv(msg))], timeout=0.001
-                )
-            else:
-                _, pending = await asyncio.wait(
-                    [asyncio.create_task(ep.recv_multi())], timeout=0.001
-                )
+        recv_result = [None]
+        recv_error = [None]
 
-            q.put("close")
-            await asyncio.wait(pending)
-            (pending,) = pending
-            result = pending.result()
+        async def do_recv():
+            try:
+                if transfer_api == "am":
+                    recv_result[0] = await ep.am_recv()
+                elif transfer_api == "tag":
+                    msg = bytearray(1)
+                    recv_result[0] = await ep.recv(msg)
+                else:
+                    recv_result[0] = await ep.recv_multi()
+            except Exception as e:
+                recv_error[0] = e
+
+        try:
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(do_recv)
+                await trio.sleep(0.001)
+                q.put("close")
+
+            if recv_error[0] is not None:
+                raise recv_error[0]
+            result = recv_result[0]
             assert isinstance(result, Exception)
             raise result
         except Exception as e:

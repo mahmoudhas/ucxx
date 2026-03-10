@@ -210,3 +210,63 @@ def get_address(ifname=None, use_ipv6=False):
         return _get_address(ifname)
     else:
         return _try_interfaces()
+
+
+async def probe_transport(ep, nbytes=4 * 1024 * 1024, warmup=2, iters=5):
+    """Send *nbytes* over *ep* and report the effective bandwidth.
+
+    Returns a dict with ``bandwidth_gbps``, ``seconds``, ``nbytes``,
+    and ``likely_transport`` (a heuristic guess based on bandwidth).
+
+    The heuristic thresholds (single direction, approximate):
+
+    =============  ============
+    Transport      Bandwidth
+    =============  ============
+    NVLink (IPC)   > 20 GB/s
+    PCIe / GDR     2 – 20 GB/s
+    TCP loopback   < 2 GB/s
+    =============  ============
+
+    Parameters
+    ----------
+    ep : ucxx.Endpoint
+        An already-connected endpoint (caller is the *sender*).
+    nbytes : int
+        Payload size for the probe transfer.
+    warmup : int
+        Number of untimed warmup iterations.
+    iters : int
+        Number of timed iterations to average.
+    """
+    import cupy as cp
+
+    buf = cp.ones(nbytes, dtype=cp.uint8)
+
+    for _ in range(warmup):
+        await ep.send(buf)
+
+    cp.cuda.get_current_stream().synchronize()
+    t0 = time.monotonic()
+    for _ in range(iters):
+        await ep.send(buf)
+    cp.cuda.get_current_stream().synchronize()
+    elapsed = time.monotonic() - t0
+
+    bw = (nbytes * iters) / elapsed
+    bw_gbps = bw / 1e9
+
+    if bw_gbps > 20:
+        transport = "nvlink/cuda_ipc"
+    elif bw_gbps > 2:
+        transport = "pcie/gdr"
+    else:
+        transport = "tcp (slow)"
+
+    return {
+        "bandwidth_gbps": round(bw_gbps, 2),
+        "seconds": round(elapsed, 4),
+        "nbytes": nbytes,
+        "iters": iters,
+        "likely_transport": transport,
+    }

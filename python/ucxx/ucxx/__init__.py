@@ -4,8 +4,32 @@
 """UCXX: Python bindings for the Unified Communication X library
 (UCX <www.openucx.org>)"""
 
+import asyncio
 import logging
 import os
+
+import trio
+import trio.lowlevel
+
+# The compiled Cython extension uses ``asyncio.sleep(0)`` in its
+# ``wait_yield`` polling loop.  Under trio that call is invalid, so we
+# redirect ``asyncio.sleep`` to detect the active framework at call time
+# and dispatch accordingly.  This is safe to call from asyncio contexts
+# too -- it falls through to the real ``asyncio.sleep`` when trio is not
+# the current runner.
+_original_asyncio_sleep = asyncio.sleep
+
+
+async def _asyncio_sleep_compat(delay, result=None):
+    try:
+        trio.lowlevel.current_trio_token()
+    except RuntimeError:
+        return await _original_asyncio_sleep(delay, result)
+    await trio.sleep(delay)
+    return result
+
+
+asyncio.sleep = _asyncio_sleep_compat
 
 # If libucx was installed as a wheel, we must request it to load the library symbols.
 # Otherwise, we assume that the library was installed in a system path that ld can find.

@@ -1,35 +1,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 import tempfile
 from itertools import chain
 
 import numpy as np
 import pytest
+import trio
 
 from ucxx.benchmarks.utils import _run_cluster_server, _run_cluster_workers
 from ucxx.testing import join_processes, terminate_process
 
 
 async def _worker(rank, eps, args):
-    futures = []
     # Send my rank to all others
-    for ep in eps.values():
-        futures.append(ep.send(np.array([rank], dtype="u4")))
-    # Recv from all others
-    result = np.empty(len(eps.values()), dtype="u4")
-    futures += list(ep.recv(result[i : i + 1]) for i, ep in enumerate(eps.values()))
-
-    # Wait for transfers to complete
-    await asyncio.gather(*futures)
+    async with trio.open_nursery() as nursery:
+        for ep in eps.values():
+            nursery.start_soon(ep.send, np.array([rank], dtype="u4"))
+        # Recv from all others
+        result = np.empty(len(eps.values()), dtype="u4")
+        for i, ep in enumerate(eps.values()):
+            nursery.start_soon(ep.recv, result[i : i + 1])
 
     # We expect to get the sum of all ranks excluding ours
     expect = sum(range(len(eps) + 1)) - rank
     assert expect == result.sum()
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 async def test_benchmark_cluster(n_chunks=1, n_nodes=2, n_workers=2):
     server_file = tempfile.NamedTemporaryFile()
 

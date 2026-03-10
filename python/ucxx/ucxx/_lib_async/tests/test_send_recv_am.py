@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import asyncio
 from functools import partial
 
 import numpy as np
 import pytest
+import trio
 
 import ucxx
 from ucxx._lib_async.utils_test import wait_listener_client_handlers
@@ -63,13 +63,17 @@ def simple_server(size, recv):
     return server
 
 
-@pytest.mark.asyncio
+@pytest.mark.trio
 @pytest.mark.parametrize("size", msg_sizes)
 @pytest.mark.parametrize("recv_wait", [True, False])
 @pytest.mark.parametrize("data", get_data())
 async def test_send_recv_am(size, recv_wait, data):
     rndv_thresh = 8192
-    ucxx.init(options={"RNDV_THRESH": str(rndv_thresh)})
+    ucxx.reset()
+    ucxx.core._init_with_nursery(
+        options={"RNDV_THRESH": str(rndv_thresh)},
+        nursery=ucxx.core._test_nursery,
+    )
 
     msg = data["generator"](size)
 
@@ -81,20 +85,28 @@ async def test_send_recv_am(size, recv_wait, data):
         for i in range(num_clients)
     ]
     if recv_wait:
-        # By sleeping here we ensure that the listener's
-        # ep.am_recv call will have to wait, rather than return
-        # immediately as receive data is already available.
-        await asyncio.sleep(1)
-    await asyncio.gather(*(c.am_send(msg) for c in clients))
-    recv_msgs = await asyncio.gather(*(c.am_recv() for c in clients))
+        await trio.sleep(1)
+
+    async with trio.open_nursery() as send_nursery:
+        for c in clients:
+            send_nursery.start_soon(c.am_send, msg)
+
+    recv_msgs = [None] * len(clients)
+
+    async def recv_and_store(idx, client):
+        recv_msgs[idx] = await client.am_recv()
+
+    async with trio.open_nursery() as recv_nursery:
+        for i, c in enumerate(clients):
+            recv_nursery.start_soon(recv_and_store, i, c)
 
     for recv_msg in recv_msgs:
         if data["memory_type"] == "cuda" and msg.nbytes < rndv_thresh:
-            # Eager messages are always received on the host, if no custom host
-            # allocator is registered, UCXX defaults to `np.array`.
             np.testing.assert_equal(recv_msg.view(np.int64), msg.get())
         else:
             data["validator"](recv_msg, msg)
 
-    await asyncio.gather(*(c.close() for c in clients))
+    async with trio.open_nursery() as close_nursery:
+        for c in clients:
+            close_nursery.start_soon(c.close)
     await wait_listener_client_handlers(listener)
